@@ -11,7 +11,12 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeReadline from "node:readline";
 
-import { CommandId, type OrchestrationThreadShell, ProjectId } from "@t3tools/contracts";
+import {
+  CommandId,
+  type OrchestrationThreadShell,
+  ProjectId,
+  type ThreadId,
+} from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
@@ -21,6 +26,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import { Argument, Command, Flag, GlobalFlag } from "effect/unstable/cli";
 
 import { projectLocationFlags, resolveCliAuthConfig } from "./config.ts";
@@ -28,6 +34,8 @@ import {
   BUILTIN_LINES,
   decodeLineDefinitionJson,
   describeProgress,
+  describeStageEvent,
+  fitToWidth,
   handoffFileName,
   type LineDefinition,
   type LineStageProgress,
@@ -206,16 +214,47 @@ interface LineRunRecord {
   >;
 }
 
-/** Polls a started stage until it stops working, printing each state change. */
+/**
+ * Polls a started stage until it stops working. State changes print as lines;
+ * on a terminal, one status line below them is redrawn with the elapsed time
+ * and what the agent is doing, fed by the thread's live events.
+ */
 const waitForStage = Effect.fn("waitForStage")(function* (
   client: StageClient,
-  threadId: string,
+  threadId: ThreadId,
   label: string,
+  worktreePath: string,
 ) {
+  const live = process.stdout.isTTY === true;
   const startedAt = yield* Clock.currentTimeMillis;
+  const elapsed = Clock.currentTimeMillis.pipe(Effect.map((now) => formatElapsed(now - startedAt)));
   let lastState: StageState | undefined;
   let lastThread: OrchestrationThreadShell | undefined;
+  let activity: string | null = null;
   let missingPolls = 0;
+
+  const clearStatus = live ? Effect.sync(() => process.stdout.write("\r\x1b[2K")) : Effect.void;
+  const drawStatus = (text: string) =>
+    Effect.sync(() =>
+      process.stdout.write(`\r\x1b[2K${fitToWidth(text, (process.stdout.columns ?? 100) - 1)}`),
+    );
+
+  if (live) {
+    // Best effort: without the socket the status line still shows elapsed time.
+    yield* client.threadEvents(threadId).pipe(
+      Stream.runForEach((event) =>
+        Effect.sync(() => {
+          if (event.type !== "thread.activity-appended" && event.type !== "thread.message-sent") {
+            return;
+          }
+          activity = describeStageEvent(event, worktreePath) ?? activity;
+        }),
+      ),
+      Effect.ignore,
+      Effect.forkScoped,
+    );
+  }
+
   const poll = Effect.gen(function* () {
     while (true) {
       const read = yield* readStage(client, threadId).pipe(
@@ -234,10 +273,14 @@ const waitForStage = Effect.fn("waitForStage")(function* (
             state === "waiting-approval" || state === "waiting-input"
               ? " (open the thread in T3 to respond, or Ctrl-C to stop)"
               : "";
-          const elapsed = formatElapsed((yield* Clock.currentTimeMillis) - startedAt);
-          yield* Console.log(`  ${label}: ${describeProgress(state)} · ${elapsed}${hint}`);
+          yield* clearStatus;
+          yield* Console.log(`  ${label}: ${describeProgress(state)} · ${yield* elapsed}${hint}`);
         }
         if (!stageIsBusy(state)) return read.value;
+        if (live) {
+          const doing = activity === null ? "" : ` · ${activity}`;
+          yield* drawStatus(`  ${label} ${describeProgress(state)} · ${yield* elapsed}${doing}`);
+        }
       }
       yield* Effect.sleep(STAGE_POLL_INTERVAL);
     }
@@ -245,15 +288,19 @@ const waitForStage = Effect.fn("waitForStage")(function* (
   // Ctrl-C stops the stage too, so nothing keeps editing the worktree unseen.
   return yield* poll.pipe(
     Effect.onInterrupt(() =>
-      lastThread === undefined
-        ? Effect.void
-        : interruptStage(client, lastThread).pipe(
-            Effect.andThen(Console.log(`\nStopped ${label}.`)),
-            Effect.ignore,
-          ),
+      clearStatus.pipe(
+        Effect.andThen(
+          lastThread === undefined
+            ? Effect.void
+            : interruptStage(client, lastThread).pipe(
+                Effect.andThen(Console.log(`Stopped ${label}.`)),
+                Effect.ignore,
+              ),
+        ),
+      ),
     ),
   );
-});
+}, Effect.scoped);
 
 const lineUuid = Crypto.Crypto.pipe(Effect.flatMap((crypto) => crypto.randomUUIDv4));
 
@@ -423,7 +470,12 @@ const lineRunCommand = Command.make("run", {
             entry.outcome = "running";
             yield* save;
 
-            const settled = yield* waitForStage(client, threadId, stage.label).pipe(
+            const settled = yield* waitForStage(
+              client,
+              threadId,
+              stage.label,
+              worktree.worktreePath,
+            ).pipe(
               Effect.onInterrupt(() =>
                 Effect.gen(function* () {
                   entry.outcome = "interrupted";

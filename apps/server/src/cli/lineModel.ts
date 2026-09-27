@@ -3,7 +3,13 @@
  * how a run is prompted and shown. A line is stages run in order on one
  * worktree; each stage is started with the same machinery as `t3 stage`.
  */
-import { RuntimeMode, TrimmedNonEmptyString } from "@t3tools/contracts";
+import {
+  type OrchestrationMessageRole,
+  type OrchestrationThreadActivity,
+  RuntimeMode,
+  TrimmedNonEmptyString,
+} from "@t3tools/contracts";
+import * as Predicate from "effect/Predicate";
 import * as Schema from "effect/Schema";
 
 import type { StageState } from "./stageModel.ts";
@@ -138,4 +144,44 @@ export function renderLineProgress(
       ].join("  "),
     )
     .join("\n");
+}
+
+/** The thread events that say what a working stage is doing right now. */
+export type StageActivityEvent =
+  | {
+      readonly type: "thread.activity-appended";
+      readonly payload: {
+        readonly activity: Pick<OrchestrationThreadActivity, "kind" | "summary" | "payload">;
+      };
+    }
+  | {
+      readonly type: "thread.message-sent";
+      readonly payload: { readonly role: OrchestrationMessageRole };
+    };
+
+/**
+ * A short phrase for the live status line: the tool call being made, or
+ * "thinking" / "writing". Null keeps the previous phrase.
+ */
+export function describeStageEvent(event: StageActivityEvent, worktreePath: string) {
+  if (event.type === "thread.message-sent") {
+    if (event.payload.role === "reasoning") return "thinking";
+    if (event.payload.role === "assistant") return "writing";
+    return null;
+  }
+  const { activity } = event.payload;
+  if (activity.kind !== "tool.started" && activity.kind !== "tool.updated") return null;
+  const detail =
+    Predicate.isObject(activity.payload) && typeof activity.payload.detail === "string"
+      ? activity.payload.detail
+      : "";
+  // Agents prefix nearly every command with `cd <worktree> &&`; it says nothing.
+  const phrase = detail.replaceAll(`cd ${worktreePath} && `, "").replace(/\s+/g, " ").trim();
+  // A started tool often has no input yet ("Bash: {}"); its summary reads better.
+  return phrase.length === 0 || phrase.endsWith(": {}") ? activity.summary : phrase;
+}
+
+/** Cuts `text` to one terminal row, marking the cut. */
+export function fitToWidth(text: string, width: number) {
+  return text.length <= width ? text : `${text.slice(0, Math.max(0, width - 1))}…`;
 }

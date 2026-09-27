@@ -5,6 +5,8 @@ import * as Schema from "effect/Schema";
 
 import {
   BUILTIN_LINES,
+  describeStageEvent,
+  fitToWidth,
   handoffFileName,
   LineDefinition,
   lineStagePrompt,
@@ -81,5 +83,41 @@ describe("renderLineProgress", () => {
         "  2  Implement  gpt-6-sol      ◐ waiting for approval",
       ].join("\n"),
     );
+  });
+});
+
+describe("describeStageEvent", () => {
+  const worktree = "/runs/wt";
+  const tool = (kind: string, detail: string) =>
+    ({
+      type: "thread.activity-appended",
+      payload: { activity: { kind, summary: "Command run", payload: { detail } } },
+    }) as const;
+  const message = (role: "reasoning" | "assistant" | "user") =>
+    ({ type: "thread.message-sent", payload: { role } }) as const;
+
+  it("shows the command without the worktree cd prefix", () => {
+    assert.equal(
+      describeStageEvent(tool("tool.updated", "Bash: cd /runs/wt && grep -n  foo src"), worktree),
+      "Bash: grep -n foo src",
+    );
+  });
+
+  it("falls back to the summary while a tool has no input yet", () => {
+    assert.equal(describeStageEvent(tool("tool.started", "Bash: {}"), worktree), "Command run");
+  });
+
+  it("says thinking or writing for reasoning and replies, and ignores the rest", () => {
+    assert.equal(describeStageEvent(message("reasoning"), worktree), "thinking");
+    assert.equal(describeStageEvent(message("assistant"), worktree), "writing");
+    assert.isNull(describeStageEvent(message("user"), worktree));
+    assert.isNull(describeStageEvent(tool("context-window.updated", ""), worktree));
+  });
+});
+
+describe("fitToWidth", () => {
+  it("keeps short text and marks where long text was cut", () => {
+    assert.equal(fitToWidth("short", 10), "short");
+    assert.equal(fitToWidth("a longer line", 8), "a longe…");
   });
 });
