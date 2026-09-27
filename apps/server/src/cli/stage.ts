@@ -10,6 +10,7 @@
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeChildProcess from "node:child_process";
 
+import * as NodeSocket from "@effect/platform-node/NodeSocket";
 import {
   AuthAdministrativeScopes,
   type ClientOrchestrationCommand,
@@ -17,12 +18,16 @@ import {
   EnvironmentHttpApi,
   MessageId,
   type ModelSelection,
+  ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+  ORCHESTRATION_PROTOCOL_VERSION,
+  ORCHESTRATION_WS_METHODS,
   type OrchestrationShellSnapshot,
   type OrchestrationThreadShell,
   ProjectId,
   ProviderInstanceId,
   type RuntimeMode,
   ThreadId,
+  WsRpcGroup,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
@@ -35,9 +40,12 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as References from "effect/References";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 import { Argument, Command, Flag, GlobalFlag } from "effect/unstable/cli";
 import { FetchHttpClient } from "effect/unstable/http";
 import * as HttpApiClient from "effect/unstable/httpapi/HttpApiClient";
+import { RpcClient, RpcSerialization } from "effect/unstable/rpc";
+import * as Socket from "effect/unstable/socket/Socket";
 
 import * as EnvironmentAuth from "../auth/EnvironmentAuth.ts";
 import * as ServerConfig from "../config.ts";
@@ -117,6 +125,45 @@ const makeStageClient = (origin: string, token: string) =>
           client.orchestration.dispatch({ headers, payload: command } as Parameters<
             typeof client.orchestration.dispatch
           >[0]),
+        ),
+      /**
+       * New events for one thread over the server's socket. Only live events
+       * flow, so watching a long turn costs nothing per poll; the socket closes
+       * when the stream is interrupted.
+       */
+      threadEvents: (threadId: ThreadId) =>
+        Stream.unwrap(
+          Effect.gen(function* () {
+            const { ticket } = yield* request(client.auth.webSocketTicket({ headers }));
+            const url = new URL(origin);
+            url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+            url.pathname = "/ws";
+            url.searchParams.set("wsTicket", ticket);
+            url.searchParams.set(
+              ORCHESTRATION_PROTOCOL_QUERY_PARAM,
+              String(ORCHESTRATION_PROTOCOL_VERSION),
+            );
+            // Built into the stream's scope, not provided to `make`: a provided
+            // layer would close the socket as soon as the client is constructed.
+            const protocol = yield* Layer.build(
+              RpcClient.layerProtocolSocket({ retryTransientErrors: false }).pipe(
+                Layer.provide(
+                  Socket.layerWebSocket(url.toString(), { openTimeout: "10 seconds" }).pipe(
+                    Layer.provide(NodeSocket.layerWebSocketConstructor),
+                  ),
+                ),
+                Layer.provide(RpcSerialization.layerJson),
+              ),
+            );
+            const rpc = yield* RpcClient.make(WsRpcGroup).pipe(Effect.provide(protocol));
+            return rpc[ORCHESTRATION_WS_METHODS.subscribeThread]({
+              threadId,
+              reasoningMessages: true,
+            }).pipe(
+              Stream.filter((item) => item.kind === "event"),
+              Stream.map((item) => item.event),
+            );
+          }),
         ),
     };
   });
