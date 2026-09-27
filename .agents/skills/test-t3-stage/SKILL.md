@@ -44,6 +44,27 @@ Use the cheapest model you have access to (for example `claudeAgent` with
 
 Exit codes: 0 idle, 1 failed, 2 running, 3 waiting on a human, 4 interrupted.
 
+## `t3 line`
+
+`t3 line run` is the attended front end over the same machinery. To smoke it:
+
+1. Put a cheap test line in `.t3/lines/<name>.json` (copy the shape from
+   `t3 line show design-implement-review`) with short prompts that write a file
+   and reply with a known word, and a request that tells stages to follow them.
+2. Create the run's worktree outside this repository (for example
+   `git -C <repo> worktree add $TMPDIR/…`) and pass it with `--worktree`.
+   Without that, `run` creates it under `.t3/lines/worktrees/`, inside this
+   repository, where Claude loads this repo's CLAUDE.md and has written to
+   this worktree instead of its own.
+3. Run `node apps/server/src/bin.ts line run <name> "<request>" --worktree <path>`
+   with answers piped on stdin: an empty line continues, `e` opens `$EDITOR`
+   (point it at a script that edits the file in place), `q` stops. End of input
+   also stops.
+4. Check that an edited handoff reaches the next stage, `git status` in this
+   repository stays clean, and `.t3/lines/runs/<id>/run.json` records each
+   stage's outcome. SIGINT to the captured PID must leave the running
+   stage `interrupted` on the server.
+
 ## When the change touches these paths
 
 - Busy guard: a second `start` on a worktree with a running stage must fail.

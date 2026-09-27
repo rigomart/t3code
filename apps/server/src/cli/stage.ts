@@ -21,6 +21,7 @@ import {
   type OrchestrationThreadShell,
   ProjectId,
   ProviderInstanceId,
+  type RuntimeMode,
   ThreadId,
 } from "@t3tools/contracts";
 import * as Console from "effect/Console";
@@ -78,7 +79,7 @@ export class StageCommandError extends Schema.TaggedError<StageCommandError>()(
 }
 
 const STAGE_REQUEST_TIMEOUT = Duration.seconds(15);
-const STAGE_POLL_INTERVAL = Duration.seconds(2);
+export const STAGE_POLL_INTERVAL = Duration.seconds(2);
 
 const decodeProviderInstanceId = Schema.decodeEffect(ProviderInstanceId);
 const stageUuid = Crypto.Crypto.pipe(Effect.flatMap((crypto) => crypto.randomUUIDv4));
@@ -120,12 +121,13 @@ const makeStageClient = (origin: string, token: string) =>
     };
   });
 
-type StageClient = Effect.Success<ReturnType<typeof makeStageClient>>;
+export type StageClient = Effect.Success<ReturnType<typeof makeStageClient>>;
+type StageCliConfig = Effect.Success<ReturnType<typeof resolveCliAuthConfig>>;
 
 /** Runs against the server that owns `--base-dir`, with a session revoked on exit. */
-const withStageClient = <A, E, R>(
+export const withStageClient = <A, E, R>(
   flags: CliAuthLocationFlags,
-  run: (client: StageClient) => Effect.Effect<A, E, R>,
+  run: (client: StageClient, config: StageCliConfig) => Effect.Effect<A, E, R>,
 ) =>
   Effect.gen(function* () {
     const logLevel = yield* GlobalFlag.LogLevel;
@@ -142,7 +144,9 @@ const withStageClient = <A, E, R>(
       return yield* Effect.acquireUseRelease(
         environmentAuth.issueSession({ scopes: AuthAdministrativeScopes, label: "t3 stage cli" }),
         (issued) =>
-          makeStageClient(runtimeState.value.origin, issued.token).pipe(Effect.flatMap(run)),
+          makeStageClient(runtimeState.value.origin, issued.token).pipe(
+            Effect.flatMap((client) => run(client, config)),
+          ),
         (issued) =>
           environmentAuth.revokeSession(issued.sessionId).pipe(Effect.ignore({ log: true })),
       );
@@ -166,7 +170,7 @@ const findStage = (shell: OrchestrationShellSnapshot, stageId: string) => {
     : Effect.succeed(thread);
 };
 
-const readStage = (client: StageClient, stageId: string) =>
+export const readStage = (client: StageClient, stageId: string) =>
   Effect.gen(function* () {
     const thread = yield* findStage(yield* client.shell, stageId);
     return { thread, state: deriveStageState(thread, yield* nowIso) };
@@ -175,31 +179,35 @@ const readStage = (client: StageClient, stageId: string) =>
 // ---------------------------------------------------------------------------
 // Worktree resolution
 
-const git = (cwd: string, args: ReadonlyArray<string>) =>
+export const git = (
+  cwd: string,
+  args: ReadonlyArray<string>,
+  failure = `${cwd} is not inside a git repository.`,
+) =>
   Effect.try({
     try: () =>
       NodeChildProcess.execFileSync("git", ["-C", cwd, ...args], {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "pipe"],
       }).trim(),
-    catch: (cause) =>
-      new StageCommandError({
-        reason: "not-a-worktree",
-        detail: `${cwd} is not inside a git repository.`,
-        cause,
-      }),
+    catch: (cause) => new StageCommandError({ reason: "not-a-worktree", detail: failure, cause }),
   });
 
 const realPathOr = (fs: FileSystem.FileSystem, path: string) =>
   fs.realPath(path).pipe(Effect.orElseSucceed(() => path));
 
-const resolveStageWorktree = Effect.fn("resolveStageWorktree")(function* (input: string) {
+/** The checkout containing `input` and the main checkout its repository belongs to. */
+export const resolveCheckout = Effect.fn("resolveCheckout")(function* (input: string) {
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const cwd = path.resolve(input);
   const worktreePath = yield* realPathOr(fs, yield* git(cwd, ["rev-parse", "--show-toplevel"]));
   const commonDir = yield* git(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-  const mainCheckout = yield* realPathOr(fs, path.dirname(commonDir));
+  return { worktreePath, mainCheckout: yield* realPathOr(fs, path.dirname(commonDir)) };
+});
+
+export const resolveStageWorktree = Effect.fn("resolveStageWorktree")(function* (input: string) {
+  const { worktreePath, mainCheckout } = yield* resolveCheckout(input);
   if (worktreePath === mainCheckout) {
     return yield* new StageCommandError({
       reason: "main-checkout",
@@ -215,7 +223,9 @@ const resolveStageWorktree = Effect.fn("resolveStageWorktree")(function* (input:
   };
 });
 
-const findProjectForCheckout = Effect.fn("findProjectForCheckout")(function* (
+export type StageWorktree = Effect.Success<ReturnType<typeof resolveStageWorktree>>;
+
+export const findProjectForCheckout = Effect.fn("findProjectForCheckout")(function* (
   shell: OrchestrationShellSnapshot,
   mainCheckout: string,
 ) {
@@ -245,6 +255,111 @@ const findBusyThreadOnWorktree = Effect.fn("findBusyThreadOnWorktree")(function*
 });
 
 // ---------------------------------------------------------------------------
+// Stage operations, shared with `t3 line`
+
+export const parseModelSelection = (provider: string, model: string) =>
+  decodeProviderInstanceId(provider).pipe(
+    Effect.map((instanceId): ModelSelection => ({ instanceId, model })),
+    Effect.mapError(
+      (cause) =>
+        new StageCommandError({
+          reason: "invalid-input",
+          detail: `'${provider}' is not a provider instance id.`,
+          cause,
+        }),
+    ),
+  );
+
+/** Creates the stage's thread on the worktree and sends its first turn. */
+export const startStage = Effect.fn("startStage")(function* (
+  client: StageClient,
+  input: {
+    readonly worktree: StageWorktree;
+    readonly modelSelection: ModelSelection;
+    readonly runtimeMode: RuntimeMode;
+    readonly title: string;
+    readonly text: string;
+  },
+) {
+  const { worktree } = input;
+  const shell = yield* client.shell;
+  const project = yield* findProjectForCheckout(shell, worktree.mainCheckout);
+  const busy = yield* findBusyThreadOnWorktree(shell, worktree.worktreePath);
+  if (Option.isSome(busy)) {
+    return yield* new StageCommandError({
+      reason: "worktree-busy",
+      detail: `Thread ${busy.value.id} (${busy.value.title}) is still working in ${worktree.worktreePath}.`,
+    });
+  }
+
+  const threadId = ThreadId.make(yield* stageUuid);
+  const createdAt = yield* nowIso;
+  const common = {
+    modelSelection: input.modelSelection,
+    runtimeMode: input.runtimeMode,
+    interactionMode: "default" as const,
+  };
+  yield* client.dispatch({
+    type: "thread.create",
+    commandId: CommandId.make(yield* stageUuid),
+    threadId,
+    projectId: ProjectId.make(project.id),
+    title: input.title,
+    branch: worktree.branch,
+    worktreePath: worktree.worktreePath,
+    createdAt,
+    ...common,
+  });
+  yield* client.dispatch({
+    type: "thread.turn.start",
+    commandId: CommandId.make(yield* stageUuid),
+    threadId,
+    message: {
+      messageId: MessageId.make(yield* stageUuid),
+      role: "user",
+      text: input.text,
+      attachments: [],
+    },
+    createdAt,
+    ...common,
+  });
+  return { threadId, projectId: project.id };
+});
+
+/** The handoff of an idle stage. Refused while the stage could still change it. */
+export const readStageHandoff = Effect.fn("readStageHandoff")(function* (
+  client: StageClient,
+  stageId: string,
+) {
+  const { thread, state } = yield* readStage(client, stageId);
+  if (state !== "idle") {
+    return yield* new StageCommandError({
+      reason: "stage-not-ready",
+      detail: `Stage ${thread.id} is ${state}; its output is only final once it is idle.`,
+    });
+  }
+  const handoff = selectStageHandoff((yield* client.thread(thread.id)).thread);
+  if (handoff === null) {
+    return yield* new StageCommandError({
+      reason: "no-handoff",
+      detail: `Stage ${thread.id} has no assistant reply yet.`,
+    });
+  }
+  return handoff;
+});
+
+export const interruptStage = (client: StageClient, thread: OrchestrationThreadShell) =>
+  Effect.gen(function* () {
+    yield* client.dispatch({
+      type: "thread.turn.interrupt",
+      commandId: CommandId.make(yield* stageUuid),
+      threadId: thread.id,
+      ...(thread.latestTurn ? { turnId: thread.latestTurn.turnId } : {}),
+      createdAt: yield* nowIso,
+    });
+  });
+
+// ---------------------------------------------------------------------------
 // Output
 
 const jsonFlag = Flag.Boolean("json").pipe(
@@ -252,7 +367,8 @@ const jsonFlag = Flag.Boolean("json").pipe(
   Flag.withDefault(false),
 );
 
-const printJson = (value: unknown) => Console.log(JSON.stringify(value, null, 2));
+export const prettyJson = (value: unknown) => JSON.stringify(value, null, 2);
+const printJson = (value: unknown) => Console.log(prettyJson(value));
 
 const stageSummary = (thread: OrchestrationThreadShell, state: StageState) => ({
   stageId: thread.id,
@@ -320,72 +436,27 @@ const stageStartCommand = Command.make("start", {
       const inputs = yield* Effect.forEach(flags.input, (file) =>
         fs.readFileString(file).pipe(Effect.map((text) => ({ name: path.basename(file), text }))),
       );
-      const instanceId = yield* decodeProviderInstanceId(flags.provider).pipe(
-        Effect.mapError(
-          (cause) =>
-            new StageCommandError({
-              reason: "invalid-input",
-              detail: `'${flags.provider}' is not a provider instance id.`,
-              cause,
-            }),
-        ),
-      );
-      const modelSelection: ModelSelection = { instanceId, model: flags.model };
+      const modelSelection = yield* parseModelSelection(flags.provider, flags.model);
       const worktree = yield* resolveStageWorktree(flags.worktree);
 
       return yield* withStageClient(flags, (client) =>
         Effect.gen(function* () {
-          const shell = yield* client.shell;
-          const project = yield* findProjectForCheckout(shell, worktree.mainCheckout);
-          const busy = yield* findBusyThreadOnWorktree(shell, worktree.worktreePath);
-          if (Option.isSome(busy)) {
-            return yield* new StageCommandError({
-              reason: "worktree-busy",
-              detail: `Thread ${busy.value.id} (${busy.value.title}) is still working in ${worktree.worktreePath}.`,
-            });
-          }
-
-          const threadId = ThreadId.make(yield* stageUuid);
-          const createdAt = yield* nowIso;
-          const common = {
+          const { threadId, projectId } = yield* startStage(client, {
+            worktree,
             modelSelection,
             runtimeMode: flags.mode,
-            interactionMode: "default" as const,
-          };
-          yield* client.dispatch({
-            type: "thread.create",
-            commandId: CommandId.make(yield* stageUuid),
-            threadId,
-            projectId: ProjectId.make(project.id),
             title: stageThreadTitle(prompt, Option.getOrUndefined(flags.label)),
-            branch: worktree.branch,
-            worktreePath: worktree.worktreePath,
-            createdAt,
-            ...common,
+            text: buildStagePrompt(prompt, inputs),
           });
-          yield* client.dispatch({
-            type: "thread.turn.start",
-            commandId: CommandId.make(yield* stageUuid),
-            threadId,
-            message: {
-              messageId: MessageId.make(yield* stageUuid),
-              role: "user",
-              text: buildStagePrompt(prompt, inputs),
-              attachments: [],
-            },
-            createdAt,
-            ...common,
-          });
-
           if (!flags.json) return yield* Console.log(threadId);
           yield* printJson({
             stageId: threadId,
-            projectId: project.id,
+            projectId,
             worktreePath: worktree.worktreePath,
             branch: worktree.branch,
             startCommit: worktree.headCommit,
-            provider: instanceId,
-            model: flags.model,
+            provider: modelSelection.instanceId,
+            model: modelSelection.model,
           });
         }),
       );
@@ -443,22 +514,8 @@ const stageOutputCommand = Command.make("output", {
   Command.withHandler((flags) =>
     withStageClient(flags, (client) =>
       Effect.gen(function* () {
-        const { thread, state } = yield* readStage(client, flags.stage);
-        if (state !== "idle") {
-          return yield* new StageCommandError({
-            reason: "stage-not-ready",
-            detail: `Stage ${thread.id} is ${state}; its output is only final once it is idle.`,
-          });
-        }
-        const detail = yield* client.thread(thread.id);
-        const handoff = selectStageHandoff(detail.thread);
-        if (handoff === null) {
-          return yield* new StageCommandError({
-            reason: "no-handoff",
-            detail: `Stage ${thread.id} has no assistant reply yet.`,
-          });
-        }
-        if (flags.json) return yield* printJson({ stageId: thread.id, ...handoff });
+        const handoff = yield* readStageHandoff(client, flags.stage);
+        if (flags.json) return yield* printJson({ stageId: flags.stage, ...handoff });
         yield* Console.log(handoff.text);
       }),
     ),
@@ -512,13 +569,7 @@ const stageStopCommand = Command.make("stop", {
       Effect.gen(function* () {
         const { thread, state } = yield* readStage(client, flags.stage);
         if (!stageIsBusy(state)) return yield* Console.log(`Stage ${thread.id} is ${state}.`);
-        yield* client.dispatch({
-          type: "thread.turn.interrupt",
-          commandId: CommandId.make(yield* stageUuid),
-          threadId: thread.id,
-          ...(thread.latestTurn ? { turnId: thread.latestTurn.turnId } : {}),
-          createdAt: yield* nowIso,
-        });
+        yield* interruptStage(client, thread);
         yield* Console.log(`Stopping ${thread.id}.`);
       }),
     ),
