@@ -11,7 +11,7 @@
 import * as NodeChildProcess from "node:child_process";
 import * as NodeReadline from "node:readline";
 
-import type { OrchestrationThreadShell } from "@t3tools/contracts";
+import { CommandId, type OrchestrationThreadShell, ProjectId } from "@t3tools/contracts";
 import * as Clock from "effect/Clock";
 import * as Console from "effect/Console";
 import * as Crypto from "effect/Crypto";
@@ -255,6 +255,35 @@ const waitForStage = Effect.fn("waitForStage")(function* (
   );
 });
 
+const lineUuid = Crypto.Crypto.pipe(Effect.flatMap((crypto) => crypto.randomUUIDv4));
+
+/** The checkout's T3 project, added on first use so a line runs in any repository. */
+const ensureProject = Effect.fn("ensureProject")(function* (
+  client: StageClient,
+  mainCheckout: string,
+) {
+  const path = yield* Path.Path;
+  const existing = yield* findProjectForCheckout(yield* client.shell, mainCheckout).pipe(
+    Effect.asSome,
+    Effect.catchIf(
+      (error) => error.reason === "project-not-found",
+      () => Effect.succeedNone,
+    ),
+  );
+  if (Option.isSome(existing)) return existing.value;
+
+  yield* client.dispatch({
+    type: "project.create",
+    commandId: CommandId.make(yield* lineUuid),
+    projectId: ProjectId.make(yield* lineUuid),
+    title: path.basename(mainCheckout),
+    workspaceRoot: mainCheckout,
+    createdAt: DateTime.formatIso(yield* DateTime.now),
+  });
+  yield* Console.log(`Added ${mainCheckout} as a T3 project.`);
+  return yield* findProjectForCheckout(yield* client.shell, mainCheckout);
+});
+
 const printDiffSummary = (worktreePath: string, startCommit: string) =>
   Effect.gen(function* () {
     const stat = yield* git(worktreePath, ["diff", "--stat", startCommit]);
@@ -300,9 +329,7 @@ const lineRunCommand = Command.make("run", {
             });
           }
 
-          const runId = (yield* Crypto.Crypto.pipe(
-            Effect.flatMap((crypto) => crypto.randomUUIDv4),
-          )).slice(0, 8);
+          const runId = (yield* lineUuid).slice(0, 8);
           const worktree = yield* Option.match(flags.worktree, {
             onSome: (existing) => resolveStageWorktree(existing),
             onNone: () =>
@@ -324,7 +351,7 @@ const lineRunCommand = Command.make("run", {
                 return yield* resolveStageWorktree(dir);
               }),
           });
-          const project = yield* findProjectForCheckout(yield* client.shell, worktree.mainCheckout);
+          const project = yield* ensureProject(client, worktree.mainCheckout);
 
           const runDir = path.join(linesDir(path, config.baseDir), "runs", runId);
           yield* fs.makeDirectory(runDir, { recursive: true });
