@@ -23,6 +23,8 @@ import { claudeHistoryCommand } from "./cli/claudeHistory.ts";
 import { serviceLauncherCommand } from "./cli/serviceLauncher.ts";
 import { servicePreflightCommand } from "./cli/servicePreflight.ts";
 import { sshHelperCommand } from "./cli/sshHelper.ts";
+import { lineCommand } from "./cli/line.ts";
+import { stageCommand } from "./cli/stage.ts";
 import { themeCommand } from "./cli/theme.ts";
 import { traceCommand } from "./cli/trace.ts";
 import { triageCommand } from "./cli/triage.ts";
@@ -64,6 +66,8 @@ export const makeCli = ({ cloudEnabled = hasCloudPublicConfig } = {}) =>
       pairCommand,
       authCommand,
       projectCommand,
+      stageCommand,
+      lineCommand,
       serviceCommand,
       updateCommand,
       uninstallCommand,
